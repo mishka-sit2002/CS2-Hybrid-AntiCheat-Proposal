@@ -1,0 +1,830 @@
+"""
+VAC Live + Overwatch 2.0 — Hybrid Anti-Cheat System Prototype
+Author: Mikhail S. | Version: 3.5 (Final)
+"""
+
+import random
+import json
+import hashlib
+import time
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+from enum import Enum
+import uuid
+
+# ============================================================================
+# SECTION 1: CORE ENUMS & DATA STRUCTURES
+# ============================================================================
+
+class JudgeTier(Enum):
+    TRAINEE = "trainee"
+    JUDGE = "judge"
+    SENIOR = "senior"
+
+class Verdict(Enum):
+    GUILTY = "guilty"
+    NOT_GUILTY = "not_guilty"
+    TOO_COMPLEX = "too_complex"
+    NEW_PATTERN = "new_pattern"
+
+class CaseStatus(Enum):
+    PENDING = "pending"
+    SHADOW_FLAGGED = "shadow_flagged"
+    BANNED = "banned"
+    ACQUITTED = "acquitted"
+    UNDER_REVIEW = "under_review"
+
+class BadgeLevel(Enum):
+    NONE = "none"
+    BRONZE = "bronze"
+    SILVER = "silver"
+    GOLD = "gold"
+    PLATINUM = "platinum"
+
+@dataclass
+class Player:
+    steam_id: str
+    nickname: str = field(repr=False)
+    total_wins: int = 0
+    total_hours: int = 0
+    rank: str = "Unranked"
+    is_banned: bool = False
+    ban_reason: Optional[str] = None
+    shadow_flags: List[Dict] = field(default_factory=list)
+
+    def meets_requirements(self, wins: int, hours: int, min_rank: str) -> bool:
+        """Check if player meets judge requirements."""
+        rank_order = ["Silver", "Gold Nova 1", "Gold Nova 3", "MG1", "MG2", "DMG", "LE", "LEM", "SMFC", "GE"]
+        try:
+            rank_idx = rank_order.index(self.rank) if self.rank in rank_order else -1
+            min_idx = rank_order.index(min_rank) if min_rank in rank_order else -1
+        except ValueError:
+            return False
+        return self.total_wins >= wins and self.total_hours >= hours and rank_idx >= min_idx
+
+@dataclass
+class Judge:
+    steam_id: str
+    nickname: str = field(repr=False)
+    total_wins: int
+    total_hours: int
+    rank: str
+
+    # Glicko-2 Rating System
+    rating: float = 1500.0
+    rd: float = 350.0  # Rating deviation
+    sigma: float = 0.06  # Volatility
+
+    # Stats
+    cases_reviewed: int = 0
+    accuracy: float = 0.0
+    correct_verdicts: int = 0
+    honeypot_fails: int = 0
+    lazy_votes: int = 0
+    new_patterns_found: int = 0
+
+    # Status
+    is_active: bool = True
+    temp_ban_until: Optional[datetime] = None
+    badge: BadgeLevel = BadgeLevel.NONE
+
+    @property
+    def tier(self) -> JudgeTier:
+        if self.meets_requirements(1000, 2000, "DMG") and self.rating >= 2000:
+            return JudgeTier.SENIOR
+        elif self.meets_requirements(500, 1000, "MG1"):
+            return JudgeTier.JUDGE
+        elif self.meets_requirements(250, 600, "Gold Nova 3"):
+            return JudgeTier.TRAINEE
+        return JudgeTier.TRAINEE
+
+    @property
+    def vote_weight(self) -> float:
+        """Calculate vote weight based on Glicko-2 rating."""
+        base_weights = {
+            JudgeTier.TRAINEE: 1.0,
+            JudgeTier.JUDGE: 3.0,
+            JudgeTier.SENIOR: 9.0
+        }
+        tier_weight = base_weights.get(self.tier, 1.0)
+        # Rating modifier: ±20% based on rating deviation from 1500
+        rating_modifier = 1.0 + ((self.rating - 1500) / 5000)
+        return max(0.5, tier_weight * rating_modifier)
+
+    def meets_requirements(self, wins: int, hours: int, min_rank: str) -> bool:
+        rank_order = ["Silver", "Gold Nova 1", "Gold Nova 3", "MG1", "MG2", "DMG", "LE", "LEM", "SMFC", "GE"]
+        try:
+            rank_idx = rank_order.index(self.rank) if self.rank in rank_order else -1
+            min_idx = rank_order.index(min_rank) if min_rank in rank_order else -1
+        except ValueError:
+            return False
+        return self.total_wins >= wins and self.total_hours >= hours and rank_idx >= min_idx
+
+    def update_accuracy(self, was_correct: bool):
+        self.cases_reviewed += 1
+        if was_correct:
+            self.correct_verdicts += 1
+        self.accuracy = self.correct_verdicts / max(1, self.cases_reviewed)
+        self._update_badge()
+
+    def _update_badge(self):
+        if self.accuracy >= 0.95 and self.cases_reviewed >= 500:
+            self.badge = BadgeLevel.PLATINUM
+        elif self.accuracy >= 0.90 and self.cases_reviewed >= 300:
+            self.badge = BadgeLevel.GOLD
+        elif self.accuracy >= 0.85 and self.cases_reviewed >= 100:
+            self.badge = BadgeLevel.SILVER
+        elif self.accuracy >= 0.80 and self.cases_reviewed >= 50:
+            self.badge = BadgeLevel.BRONZE
+
+    def apply_lazy_penalty(self):
+        self.lazy_votes += 1
+        if self.lazy_votes >= 3:
+            self.temp_ban_until = datetime.now() + timedelta(days=7)
+            self.is_active = False
+            print(f"⚠️  Judge {self.steam_id[:8]}... temporarily banned for lazy voting.")
+
+    def apply_honeypot_penalty(self):
+        self.honeypot_fails += 1
+        self.rating -= 100  # Glicko-2 decay
+        self.rd = min(350, self.rd + 50)
+        if self.honeypot_fails >= 3:
+            self.is_active = False
+            print(f"🚫 Judge {self.steam_id[:8]}... permanently removed for honeypot failures.")
+
+@dataclass
+class EvidenceFragment:
+    fragment_id: str
+    timestamp: float
+    duration: int  # seconds
+    telemetry_data: Dict
+    is_honeypot: bool = False
+    honeypot_type: Optional[str] = None  # "aimlock", "wallhack"
+
+    def analyze_honeypot_trigger(self) -> bool:
+        """Deterministic detection: did crosshair snap to invisible entity?"""
+        if not self.is_honeypot:
+            return False
+
+        aim_data = self.telemetry_data.get("aim_snap_events", [])
+        wall_data = self.telemetry_data.get("wall_trace_events", [])
+
+        if self.honeypot_type == "aimlock":
+            # Mathematical proof: crosshair snapped to invisible hitbox
+            return len(aim_data) > 0 and any(e["target_invisible"] for e in aim_data)
+
+        elif self.honeypot_type == "wallhack":
+            # Mathematical proof: player tracked entity through solid geometry
+            return len(wall_data) > 0 and any(e["through_wall"] for e in wall_data)
+
+        return False
+
+@dataclass
+class Case:
+    case_id: str
+    suspect_id: str
+    reported_by: List[str]
+    fragments: List[EvidenceFragment]
+    status: CaseStatus = CaseStatus.PENDING
+
+    # Anonymization
+    anonymized_id: str = field(default_factory=lambda: hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()[:16])
+
+    # Verdicts
+    verdicts: List[Tuple[str, Verdict, float, float]] = field(default_factory=list)  # (judge_id, verdict, weight, time_spent)
+
+    # Shadow monitoring
+    shadow_verdict: Optional[Verdict] = None
+    shadow_matches_remaining: int = 0
+
+    # Metadata
+    created_at: datetime = field(default_factory=datetime.now)
+    resolved_at: Optional[datetime] = None
+    final_verdict: Optional[Verdict] = None
+
+    # Data retention
+    data_deletion_scheduled: Optional[datetime] = None
+
+    def add_verdict(self, judge: Judge, verdict: Verdict, time_spent: float):
+        if not judge.is_active:
+            raise ValueError("Judge is not active")
+        if judge.temp_ban_until and judge.temp_ban_until > datetime.now():
+            raise ValueError("Judge is temporarily banned")
+
+        # Lazy voting detection (< 90 seconds)
+        if time_spent < 90:
+            judge.apply_lazy_penalty()
+            if not judge.is_active:
+                return
+
+        weight = judge.vote_weight
+        self.verdicts.append((judge.steam_id, verdict, weight, time_spent))
+
+    def calculate_consensus(self, min_judges: int = 20, max_judges: int = 30) -> Optional[Verdict]:
+        if len(self.verdicts) < min_judges:
+            return None
+
+        weighted_guilty = sum(v[2] for v in self.verdicts if v[1] == Verdict.GUILTY)
+        weighted_not_guilty = sum(v[2] for v in self.verdicts if v[1] == Verdict.NOT_GUILTY)
+        weighted_too_complex = sum(v[2] for v in self.verdicts if v[1] == Verdict.TOO_COMPLEX)
+        total_weight = weighted_guilty + weighted_not_guilty + weighted_too_complex
+
+        if total_weight == 0:
+            return None
+
+        guilty_ratio = weighted_guilty / total_weight
+        not_guilty_ratio = weighted_not_guilty / total_weight
+
+        # Require 75% weighted consensus
+        if guilty_ratio >= 0.75:
+            return Verdict.GUILTY
+        elif not_guilty_ratio >= 0.75:
+            return Verdict.NOT_GUILTY
+        elif len(self.verdicts) >= max_judges:
+            # Max judges reached, case too complex
+            return Verdict.TOO_COMPLEX
+
+        return None
+
+    def finalize_verdict(self, verdict: Verdict):
+        self.final_verdict = verdict
+        self.resolved_at = datetime.now()
+        self.data_deletion_scheduled = self.resolved_at + timedelta(days=7)
+
+        if verdict == Verdict.GUILTY:
+            self.status = CaseStatus.SHADOW_FLAGGED
+            self.shadow_matches_remaining = random.randint(2, 3)
+        else:
+            self.status = CaseStatus.ACQUITTED
+
+# ============================================================================
+# SECTION 2: GLICKO-2 RATING SYSTEM
+# ============================================================================
+
+class Glicko2System:
+    """Implementation of Glicko-2 rating system for judge reliability."""
+
+    TAU = 0.5  # System constant
+
+    @staticmethod
+    def scale_down(rating: float, rd: float) -> Tuple[float, float]:
+        mu = (rating - 1500) / 173.7178
+        phi = rd / 173.7178
+        return mu, phi
+
+    @staticmethod
+    def scale_up(mu: float, phi: float) -> Tuple[float, float]:
+        rating = 173.7178 * mu + 1500
+        rd = 173.7178 * phi
+        return rating, rd
+
+    @classmethod
+    def update_rating(cls, judge: Judge, outcomes: List[Tuple[float, float, float]]):
+        """
+        Update judge rating based on case outcomes.
+        outcomes: List of (opponent_rating, opponent_rd, score) where score is 1 for correct, 0 for incorrect
+        """
+        mu, phi = cls.scale_down(judge.rating, judge.rd)
+        sigma = judge.sigma
+
+        if not outcomes:
+            # Rating decay for inactivity
+            phi = min(350 / 173.7178, (phi**2 + sigma**2)**0.5)
+            judge.rating, judge.rd = cls.scale_up(mu, phi)
+            return
+
+        v = sum(
+            (cls._g(phi_j)**2 * cls._E(mu, mu_j, phi_j) * (1 - cls._E(mu, mu_j, phi_j)))
+            for mu_j, phi_j, _ in outcomes
+        ) ** -1
+
+        delta = v * sum(
+            cls._g(phi_j) * (score - cls._E(mu, mu_j, phi_j))
+            for mu_j, phi_j, score in outcomes
+        )
+
+        # Update volatility
+        sigma_prime = cls._update_volatility(mu, phi, sigma, v, delta)
+
+        phi_star = (phi**2 + sigma_prime**2)**0.5
+        phi_prime = 1 / ((1 / phi_star**2) + (1 / v))
+        mu_prime = mu + phi_prime * sum(
+            cls._g(phi_j) * (score - cls._E(mu, mu_j, phi_j))
+            for mu_j, phi_j, score in outcomes
+        )
+
+        judge.rating, judge.rd = cls.scale_up(mu_prime, phi_prime)
+        judge.sigma = sigma_prime
+
+    @staticmethod
+    def _g(phi: float) -> float:
+        return 1 / (1 + 3 * phi**2 / (3.14159265359**2))**0.5
+
+    @staticmethod
+    def _E(mu: float, mu_j: float, phi_j: float) -> float:
+        return 1 / (1 + 10**(-Glicko2System._g(phi_j) * (mu - mu_j) / 2))
+
+    @classmethod
+    def _update_volatility(cls, mu: float, phi: float, sigma: float, v: float, delta: float) -> float:
+        a = (sigma**2)
+        epsilon = 0.000001
+
+        def f(x):
+            return ((3.14159265359**2 * x**2) / (2 * (phi**2 + v + x**2)**2)) - ((delta**2 - phi**2 - v - x**2) / (2 * (phi**2 + v + x**2)**2))
+
+        # Simplified iteration
+        return max(0.01, sigma * 0.95)  # Simplified for prototype
+
+# ============================================================================
+# SECTION 3: ANTI-CHEAT ENGINE
+# ============================================================================
+
+class AntiCheatEngine:
+    def __init__(self):
+        self.players: Dict[str, Player] = {}
+        self.judges: Dict[str, Judge] = {}
+        self.cases: Dict[str, Case] = {}
+        self.ml_patterns: List[Dict] = []  # Known cheat signatures
+        self.honeypot_cases_injected: int = 0
+
+    def register_player(self, steam_id: str, nickname: str, wins: int, hours: int, rank: str):
+        self.players[steam_id] = Player(steam_id, nickname, wins, hours, rank)
+
+    def register_judge(self, steam_id: str, nickname: str, wins: int, hours: int, rank: str) -> Judge:
+        judge = Judge(steam_id, nickname, wins, hours, rank)
+        self.judges[steam_id] = judge
+        return judge
+
+    def create_case(self, suspect_id: str, reporter_ids: List[str], 
+                    fragments_data: List[Dict], is_honeypot_case: bool = False) -> Case:
+        """Create a new case with evidence fragments."""
+        case_id = f"CASE-{hashlib.sha256(str(time.time()).encode()).hexdigest()[:12].upper()}"
+
+        fragments = []
+        for i, data in enumerate(fragments_data):
+            frag = EvidenceFragment(
+                fragment_id=f"{case_id}-FRAG-{i}",
+                timestamp=time.time(),
+                duration=data.get("duration", 15),
+                telemetry_data=data.get("telemetry", {}),
+                is_honeypot=data.get("is_honeypot", False),
+                honeypot_type=data.get("honeypot_type")
+            )
+            fragments.append(frag)
+
+        case = Case(case_id, suspect_id, reporter_ids, fragments)
+        self.cases[case_id] = case
+
+        if is_honeypot_case:
+            self.honeypot_cases_injected += 1
+            print(f"🍯 Honeypot case injected: {case_id}")
+
+        return case
+
+    def assign_judges(self, case: Case, count: int = 25) -> List[Judge]:
+        """Assign random active judges to a case."""
+        active_judges = [j for j in self.judges.values() if j.is_active]
+        if len(active_judges) < count:
+            count = len(active_judges)
+        return random.sample(active_judges, count)
+
+    def simulate_verdicts(self, case: Case, judges: List[Judge], 
+                          actual_cheating: bool = False):
+        """Simulate judges reviewing a case."""
+        for judge in judges:
+            # Simulate review time (some judges are lazy)
+            time_spent = random.gauss(180, 60)  # Mean 3 minutes
+            if random.random() < 0.05:  # 5% lazy judges
+                time_spent = random.randint(30, 80)
+
+            time_spent = max(30, time_spent)
+
+            # Judge accuracy based on rating
+            accuracy = 0.5 + (judge.rating - 1000) / 4000  # 0.5 to ~1.0
+            accuracy = max(0.6, min(0.98, accuracy))
+
+            # Determine verdict
+            if random.random() < accuracy:
+                verdict = Verdict.GUILTY if actual_cheating else Verdict.NOT_GUILTY
+            else:
+                verdict = Verdict.NOT_GUILTY if actual_cheating else Verdict.GUILTY
+
+            # 10% chance to flag new pattern (only for good judges on actual cheats)
+            if actual_cheating and judge.rating > 1800 and random.random() < 0.1:
+                verdict = Verdict.NEW_PATTERN
+                judge.new_patterns_found += 1
+
+            try:
+                case.add_verdict(judge, verdict, time_spent)
+
+                # Update judge accuracy (ground truth known for simulation)
+                if verdict in [Verdict.GUILTY, Verdict.NOT_GUILTY]:
+                    was_correct = (verdict == Verdict.GUILTY) == actual_cheating
+                    judge.update_accuracy(was_correct)
+
+            except ValueError as e:
+                continue
+
+    def process_case(self, case_id: str) -> Dict:
+        """Process a case through the full pipeline."""
+        case = self.cases[case_id]
+        suspect = self.players.get(case.suspect_id)
+
+        # Step 1: VAC Live - Check honeypot triggers (deterministic)
+        honeypot_triggers = sum(1 for f in case.fragments if f.analyze_honeypot_trigger())
+
+        # Step 2: Assign judges
+        judges = self.assign_judges(case, count=random.randint(20, 30))
+
+        # Step 3: Simulate verdicts (in production, judges actually review)
+        # Determine if suspect is actually cheating (for simulation)
+        actual_cheating = honeypot_triggers > 0 or random.random() < 0.3
+        self.simulate_verdicts(case, judges, actual_cheating)
+
+        # Step 4: Check consensus
+        consensus = case.calculate_consensus()
+
+        # Step 5: Honeypot case check — always evaluate regardless of consensus
+        is_honeypot_case = any(f.is_honeypot for f in case.fragments)
+        if is_honeypot_case:
+            expected = Verdict.GUILTY  # Honeypot cases are always guilty
+            for judge_id, verdict, _, _ in case.verdicts:
+                judge = self.judges[judge_id]
+                if verdict != expected:
+                    judge.apply_honeypot_penalty()
+
+        result = {
+            "case_id": case_id,
+            "suspect": case.suspect_id[:8] + "...",
+            "honeypot_triggers": honeypot_triggers,
+            "judges_assigned": len(judges),
+            "consensus": consensus.value if consensus else "pending",
+            "status": case.status.value,
+            "actual_cheating": actual_cheating
+        }
+
+        if consensus:
+            case.finalize_verdict(consensus)
+            result["status"] = case.status.value
+
+            if consensus == Verdict.GUILTY and suspect:
+                # Shadow flag instead of immediate ban
+                case.shadow_verdict = Verdict.GUILTY
+                case.shadow_matches_remaining = random.randint(2, 3)
+                print(f"⚡ Case {case_id}: GUILTY verdict. Shadow monitoring activated ({case.shadow_matches_remaining} matches).")
+            elif consensus == Verdict.NOT_GUILTY:
+                print(f"✅ Case {case_id}: NOT GUILTY. Suspect acquitted.")
+
+        return result
+
+    def shadow_monitoring_tick(self, case_id: str, match_telemetry: Dict) -> Dict:
+        """Process one match during shadow monitoring phase."""
+        case = self.cases[case_id]
+
+        if case.status != CaseStatus.SHADOW_FLAGGED or case.shadow_matches_remaining <= 0:
+            return {"error": "Case not in shadow monitoring"}
+
+        case.shadow_matches_remaining -= 1
+
+        # Check if suspicious patterns persist
+        aim_anomalies = match_telemetry.get("aim_anomalies", 0)
+        wall_traces = match_telemetry.get("wall_traces", 0)
+
+        # Human norms: < 3 aim anomalies, < 5 wall traces per match
+        is_still_suspicious = aim_anomalies > 3 or wall_traces > 5
+
+        result = {
+            "case_id": case_id,
+            "matches_remaining": case.shadow_matches_remaining,
+            "aim_anomalies": aim_anomalies,
+            "wall_traces": wall_traces,
+            "still_suspicious": is_still_suspicious
+        }
+
+        if case.shadow_matches_remaining == 0:
+            if is_still_suspicious:
+                # Finalize ban
+                case.status = CaseStatus.BANNED
+                suspect = self.players.get(case.suspect_id)
+                if suspect:
+                    suspect.is_banned = True
+                    suspect.ban_reason = "Overwatch 2.0 - Consensus Guilty + Shadow Monitoring Confirmed"
+                result["final_action"] = "BANNED"
+                print(f"🔨 BAN FINALIZED: {case_id} — Shadow monitoring confirmed cheating patterns.")
+            else:
+                # Return to human norms, remove flag
+                case.status = CaseStatus.ACQUITTED
+                result["final_action"] = "FLAG_REMOVED"
+                print(f"🛡️ FLAG REMOVED: {case_id} — Performance returned to human norms.")
+        else:
+            result["final_action"] = "CONTINUE_MONITORING"
+
+        return result
+
+    def cleanup_expired_data(self):
+        """Delete raw video data 7 days post-verdict."""
+        now = datetime.now()
+        cleaned = 0
+        for case in self.cases.values():
+            if case.data_deletion_scheduled and case.data_deletion_scheduled <= now:
+                # In real system: delete video files
+                case.fragments = []  # Clear fragments
+                cleaned += 1
+        return cleaned
+
+    def get_system_stats(self) -> Dict:
+        """Get overall system statistics."""
+        total_cases = len(self.cases)
+        banned = sum(1 for c in self.cases.values() if c.status == CaseStatus.BANNED)
+        acquitted = sum(1 for c in self.cases.values() if c.status == CaseStatus.ACQUITTED)
+        pending = sum(1 for c in self.cases.values() if c.status == CaseStatus.PENDING)
+        shadow = sum(1 for c in self.cases.values() if c.status == CaseStatus.SHADOW_FLAGGED)
+
+        judge_stats = {
+            "total": len(self.judges),
+            "active": sum(1 for j in self.judges.values() if j.is_active),
+            "avg_rating": sum(j.rating for j in self.judges.values()) / max(1, len(self.judges)),
+            "avg_accuracy": sum(j.accuracy for j in self.judges.values()) / max(1, len(self.judges)),
+            "platinum_badges": sum(1 for j in self.judges.values() if j.badge == BadgeLevel.PLATINUM)
+        }
+
+        return {
+            "cases": {
+                "total": total_cases,
+                "banned": banned,
+                "acquitted": acquitted,
+                "pending": pending,
+                "shadow_flagged": shadow,
+                "ban_rate": banned / max(1, total_cases)
+            },
+            "judges": judge_stats,
+            "honeypot_cases_injected": self.honeypot_cases_injected,
+            "ml_patterns_known": len(self.ml_patterns)
+        }
+
+# ============================================================================
+# SECTION 4: SIMULATION & DEMONSTRATION
+# ============================================================================
+
+def run_simulation():
+    """Run a full simulation of the hybrid anti-cheat system."""
+    print("=" * 70)
+    print("VAC Live + Overwatch 2.0 — Hybrid Anti-Cheat System")
+    print("Prototype Simulation v3.5")
+    print("=" * 70)
+
+    engine = AntiCheatEngine()
+
+    # Register players
+    print("\n📋 Registering players...")
+    for i in range(100):
+        ranks = ["Gold Nova 3", "MG1", "MG2", "DMG", "LE", "LEM"]
+        engine.register_player(
+            f"STEAM_{i:03d}",
+            f"Player_{i}",
+            wins=random.randint(100, 2000),
+            hours=random.randint(500, 5000),
+            rank=random.choice(ranks)
+        )
+
+    # Register judges with varying skill levels
+    print("📋 Registering judges...")
+    for i in range(50):
+        tiers = [
+            (250, 600, "Gold Nova 3"),   # Trainee
+            (500, 1000, "MG1"),          # Judge
+            (1000, 2000, "DMG")          # Senior
+        ]
+        wins, hours, rank = random.choice(tiers)
+        # Add some variance
+        wins += random.randint(-50, 500)
+        hours += random.randint(-100, 1000)
+
+        judge = engine.register_judge(
+            f"JUDGE_{i:03d}",
+            f"Judge_{i}",
+            wins=max(250, wins),
+            hours=max(600, hours),
+            rank=rank
+        )
+        # Set initial rating variance
+        judge.rating = random.gauss(1500, 300)
+        judge.rating = max(800, min(2500, judge.rating))
+
+    print(f"   ✓ {len(engine.players)} players registered")
+    print(f"   ✓ {len(engine.judges)} judges registered")
+
+    # Create cases
+    print("\n🔍 Creating cases...")
+    case_ids = []
+    for i in range(20):
+        suspect = random.choice(list(engine.players.values()))
+        reporters = random.sample(list(engine.players.keys()), k=random.randint(1, 3))
+
+        # Generate fragments
+        fragments = []
+        for j in range(random.randint(3, 8)):
+            is_honeypot = random.random() < 0.15  # 15% honeypot cases
+            frag_data = {
+                "duration": random.randint(10, 30),
+                "telemetry": {
+                    "aim_snap_events": [
+                        {"target_invisible": True, "delta_degrees": 0.1}
+                    ] if is_honeypot and random.random() < 0.8 else [],
+                    "wall_trace_events": [
+                        {"through_wall": True, "duration_ms": 500}
+                    ] if is_honeypot and random.random() < 0.7 else []
+                },
+                "is_honeypot": is_honeypot,
+                "honeypot_type": random.choice(["aimlock", "wallhack"]) if is_honeypot else None
+            }
+            fragments.append(frag_data)
+
+        case = engine.create_case(
+            suspect.steam_id,
+            reporters,
+            fragments,
+            is_honeypot_case=any(f.get("is_honeypot") for f in fragments)
+        )
+        case_ids.append(case.case_id)
+
+    print(f"   ✓ {len(case_ids)} cases created")
+
+    # Process cases
+    print("\n⚖️  Processing cases through Overwatch 2.0...")
+    for case_id in case_ids:
+        result = engine.process_case(case_id)
+
+    # Shadow monitoring phase
+    print("\n👁️  Shadow Monitoring Phase (2-3 matches)...")
+    shadow_cases = [c for c in engine.cases.values() if c.status == CaseStatus.SHADOW_FLAGGED]
+
+    for case in shadow_cases:
+        matches_to_sim = case.shadow_matches_remaining
+        for match_num in range(matches_to_sim):
+            # Simulate match telemetry
+            telemetry = {
+                "aim_anomalies": random.randint(0, 8) if random.random() < 0.6 else random.randint(0, 2),
+                "wall_traces": random.randint(0, 10) if random.random() < 0.5 else random.randint(0, 3)
+            }
+            result = engine.shadow_monitoring_tick(case.case_id, telemetry)
+
+    # Cleanup
+    print("\n🧹 Running data retention cleanup...")
+    # Fast-forward time for demo (normally runs via cron)
+    for case in engine.cases.values():
+        if case.resolved_at:
+            case.data_deletion_scheduled = datetime.now() - timedelta(days=1)
+    cleaned = engine.cleanup_expired_data()
+    print(f"   ✓ Cleaned {cleaned} expired cases")
+
+    # Final stats
+    print("\n" + "=" * 70)
+    print("FINAL SYSTEM STATISTICS")
+    print("=" * 70)
+    stats = engine.get_system_stats()
+
+    print(f"""
+📊 CASE STATISTICS:
+   Total Cases:      {stats['cases']['total']}
+   Banned:           {stats['cases']['banned']} ({stats['cases']['ban_rate']*100:.1f}%)
+   Acquitted:        {stats['cases']['acquitted']}
+   Shadow Flagged:   {stats['cases']['shadow_flagged']}
+   Pending:          {stats['cases']['pending']}
+
+👥 JUDGE STATISTICS:
+   Total Judges:     {stats['judges']['total']}
+   Active Judges:    {stats['judges']['active']}
+   Avg Rating:       {stats['judges']['avg_rating']:.0f}
+   Avg Accuracy:     {stats['judges']['avg_accuracy']*100:.1f}%
+   Platinum Badges:  {stats['judges']['platinum_badges']}
+
+🛡️  SYSTEM HEALTH:
+   Honeypot Cases:   {stats['honeypot_cases_injected']}
+   ML Patterns:      {stats['ml_patterns_known']}
+    """)
+
+    # Sample judge profiles
+    print("\n🏅 TOP JUDGES (Sample):")
+    top_judges = sorted(engine.judges.values(), key=lambda j: j.rating, reverse=True)[:5]
+    for i, judge in enumerate(top_judges, 1):
+        print(f"   {i}. {judge.steam_id[:8]}... | Rating: {judge.rating:.0f} | "
+              f"Tier: {judge.tier.value.upper()} | Accuracy: {judge.accuracy*100:.1f}% | "
+              f"Badge: {judge.badge.value.upper()}")
+
+    print("\n" + "=" * 70)
+    print("Simulation complete. System operational.")
+    print("=" * 70)
+
+    return engine
+
+# ============================================================================
+# SECTION 5: INTERACTIVE API (For integration)
+# ============================================================================
+
+class OverwatchAPI:
+    """REST-like API interface for the anti-cheat system."""
+
+    def __init__(self, engine: AntiCheatEngine):
+        self.engine = engine
+
+    def report_player(self, suspect_id: str, reporter_id: str, 
+                      evidence_clips: List[Dict]) -> Dict:
+        """Submit a player report with evidence."""
+        case = self.engine.create_case(
+            suspect_id,
+            [reporter_id],
+            evidence_clips
+        )
+        return {
+            "case_id": case.case_id,
+            "status": "submitted",
+            "estimated_judges": "20-30",
+            "anonymized_id": case.anonymized_id
+        }
+
+    def submit_verdict(self, judge_id: str, case_id: str, 
+                       verdict: str, time_spent: float) -> Dict:
+        """Submit a judge verdict."""
+        judge = self.engine.judges.get(judge_id)
+        case = self.engine.cases.get(case_id)
+
+        if not judge or not case:
+            return {"error": "Invalid judge or case ID"}
+
+        try:
+            verdict_enum = Verdict(verdict)
+            case.add_verdict(judge, verdict_enum, time_spent)
+
+            # Check if consensus reached
+            consensus = case.calculate_consensus()
+            if consensus:
+                case.finalize_verdict(consensus)
+                return {
+                    "status": "consensus_reached",
+                    "verdict": consensus.value,
+                    "case_status": case.status.value
+                }
+
+            return {
+                "status": "verdict_recorded",
+                "judges_so_far": len(case.verdicts),
+                "consensus": "pending"
+            }
+
+        except ValueError as e:
+            return {"error": str(e)}
+
+    def get_case_status(self, case_id: str) -> Dict:
+        """Get current case status."""
+        case = self.engine.cases.get(case_id)
+        if not case:
+            return {"error": "Case not found"}
+
+        return {
+            "case_id": case_id,
+            "status": case.status.value,
+            "verdicts_count": len(case.verdicts),
+            "shadow_matches_remaining": case.shadow_matches_remaining,
+            "final_verdict": case.final_verdict.value if case.final_verdict else None
+        }
+
+    def get_judge_profile(self, judge_id: str) -> Dict:
+        """Get judge statistics."""
+        judge = self.engine.judges.get(judge_id)
+        if not judge:
+            return {"error": "Judge not found"}
+
+        return {
+            "judge_id": judge_id,
+            "tier": judge.tier.value,
+            "rating": round(judge.rating, 2),
+            "rd": round(judge.rd, 2),
+            "vote_weight": round(judge.vote_weight, 2),
+            "cases_reviewed": judge.cases_reviewed,
+            "accuracy": round(judge.accuracy * 100, 2),
+            "badge": judge.badge.value,
+            "is_active": judge.is_active
+        }
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+if __name__ == "__main__":
+    engine = run_simulation()
+
+    # Demonstrate API
+    print("\n📡 API DEMONSTRATION:")
+    api = OverwatchAPI(engine)
+
+    # Show a judge profile
+    sample_judge = list(engine.judges.values())[0]
+    profile = api.get_judge_profile(sample_judge.steam_id)
+    print(f"\nJudge Profile: {json.dumps(profile, indent=2)}")
+
+    # Show a case status
+    sample_case = list(engine.cases.values())[0]
+    status = api.get_case_status(sample_case.case_id)
+    print(f"\nCase Status: {json.dumps(status, indent=2)}")
