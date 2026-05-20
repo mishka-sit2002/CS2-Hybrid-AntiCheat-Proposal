@@ -11,16 +11,16 @@ class Player:
         self.id = player_id
         self.role = role  # Options: 'clean', 'cheater', 'pro'
         self.status = "Active"  # Options: 'Active', 'Shadow_Flagged', 'Banned'
-        self.honeypot_triggered = False
+        self.vac_live_flagged = False  # Track if VAC Live flags them as suspicious
+        self.honeypot_deployed = False  # Track if a dynamic honeypot was requested
+        self.honeypot_triggered = False  # Target snapped to invisible geometry
         self.shadow_matches_left = 0
-        self.lucky_shot_trigger = False  # False alarms on clean players
 
 class Judge:
     def __init__(self, judge_id):
         self.id = judge_id
-        # Base Glicko-2 rating distribution
-        self.rating = random.randint(1300, 2100) 
-        self.lazy_voter = random.random() < 0.05  # 5% probability of a low-effort spam clicker
+        self.rating = random.randint(1300, 2100)  # Glicko-2 rating
+        self.lazy_voter = random.random() < 0.05  # 5% probability of a low-effort spam voter
         self.test_cases_passed = 0
         self.test_cases_failed = 0
 
@@ -39,13 +39,11 @@ class Judge:
             return 1
         elif self.rank == "Judge":
             return 3
-        else: # Senior Judge
+        else:
             return 9
 
     def evaluate_case(self, player, is_test_case=False):
-        """Simulates judge decision-making based on rating, accuracy, and player type."""
         if self.lazy_voter:
-            # Lazy voters randomly select a verdict to click through quickly
             return random.choice(["Guilty", "Innocent"])
 
         # Base accuracy scales with Glicko-2 rating (ranging from 65% to 98%)
@@ -55,14 +53,11 @@ class Judge:
         roll = random.random()
         
         if player.role == "cheater":
-            # Correct verdict is Guilty
             return "Guilty" if roll <= accuracy else "Innocent"
         elif player.role == "clean":
-            # Correct verdict is Innocent
             return "Innocent" if roll <= accuracy else "Guilty"
         elif player.role == "pro":
-            # Professional players display inhuman mechanics, making them hard to distinguish
-            # Standard accuracy drops significantly when evaluating clean high-tier pros
+            # High-tier pros display mechanics that standard judges may confuse with cheats
             pro_detection_accuracy = accuracy * 0.60
             return "Innocent" if roll <= pro_detection_accuracy else "Guilty"
 
@@ -89,86 +84,103 @@ judges = [Judge(f"JUDGE_{i+1}") for i in range(JUDGES_COUNT)]
 
 print(f"Registered Players: {len(players)} (Clean: {clean_count}, Cheaters: {SUSPICIOUS_PLAYERS_COUNT}, Pros: {PRO_PLAYERS_COUNT})")
 print(f"Active Overwatch Judges: {len(judges)}")
-print("-" * 70)
+print("-" * 75)
 
 
 # ==========================================
-# PHASE 1: ACTIVE DETECTION (HONEYPOTS)
+# PHASE 1: VAC LIVE TELEMETRY MONITORING
 # ==========================================
-print("\n[PHASE 1] Deploying Geometric Honeypots (Invisible Entity Traps)...")
-honeypot_triggers = 0
+print("\n[PHASE 1] VAC Live Telemetry Scan (Monitoring matches in real-time)...")
+vac_live_flags = 0
+
 for p in players:
     if p.role == "cheater":
-        # Simulate 35% of cheaters instantly snapping to invisible geometry
-        if random.random() < 0.35:
-            p.honeypot_triggered = True
-            p.status = "Shadow_Flagged"  # Direct bypass to Shadow verification phase
-            p.shadow_matches_left = 2
-            honeypot_triggers += 1
+        # 85% of cheaters display anomalous camera movements or aiming telemetry
+        if random.random() < 0.85:
+            p.vac_live_flagged = True
+            vac_live_flags += 1
+    elif p.role == "pro":
+        # 100% of pro players trigger telemetry warnings due to extreme flick speeds and accuracy
+        p.vac_live_flagged = True
+        vac_live_flags += 1
+    elif p.role == "clean":
+        # Only 2% of standard clean players trigger flags due to lucky shots
+        if random.random() < 0.02:
+            p.vac_live_flagged = True
+            vac_live_flags += 1
 
-print(f">> Honeypots provided mathematical proof of cheat software for {honeypot_triggers} players. Bypassing normal queue to Shadow Flag.")
+print(f">> VAC Live flagged {vac_live_flags} suspicious players based on real-time telemetry anomalies.")
 
 
 # ==========================================
-# PHASE 2: GENERATING THE OVERWATCH QUEUE
+# PHASE 2: ON-DEMAND HONEYPOT DEPLOYMENT
 # ==========================================
+print("\n[PHASE 2] Requesting Dynamic Honeypots (On-Demand Deployment for flagged players)...")
+honeypots_deployed_count = 0
+honeypots_triggered_count = 0
+
+for p in players:
+    if p.vac_live_flagged:
+        # The game server dynamically spawns invisible hitboxes in nearby walls ONLY for this player
+        p.honeypot_deployed = True
+        honeypots_deployed_count += 1
+        
+        if p.role == "cheater":
+            # Active wallhackers/aimlockers have a 50% chance of snapping to these newly spawned entities
+            if random.random() < 0.50:
+                p.honeypot_triggered = True
+                p.status = "Shadow_Flagged"  # Bypasses standard queues to Shadow Phase with 100% proof
+                p.shadow_matches_left = 2
+                honeypots_triggered_count += 1
+        else:
+            # Clean players and Pros cannot see the entities inside solid geometry.
+            # Thus, they have a 0% chance of triggering them, ensuring no false positives.
+            p.honeypot_triggered = False
+
+print(f">> Server spawned honeypot entities for {honeypots_deployed_count} flagged accounts.")
+print(f">> Trap Results: {honeypots_triggered_count} cheaters snapped to invisible geometry (Deterministic Proof).")
+
+
+# ==========================================
+# PHASE 3: DISTRIBUTING UNRESOLVED CASES TO OVERWATCH
+# ==========================================
+print("\n[PHASE 3] Routing Unresolved Cases to Overwatch queues...")
 patrol_queue = []
 pro_queue = []
 
 for p in players:
-    if p.honeypot_triggered:
-        continue  # Already processed by active detection
+    if not p.vac_live_flagged:
+        continue  # Player was completely normal
     
-    if p.role == "cheater":
-        patrol_queue.append(p)
-    elif p.role == "pro":
-        # Keep pro players separate for high-tier review
+    if p.honeypot_triggered:
+        continue  # Already caught with deterministic proof
+    
+    # If they were flagged but did not trip the honeypot, they go to standard manual review
+    if p.role == "pro":
         pro_queue.append(p)
-    elif p.role == "clean":
-        # ~2% of clean players perform exceptionally well and receive random reports ("lucky shots")
-        if random.random() < 0.02:
-            p.lucky_shot_trigger = True
-            patrol_queue.append(p)
+    else:
+        patrol_queue.append(p)
 
-print(f">> Overwatch Queue built. Suspicious cases pending evaluation: {len(patrol_queue)}")
+print(f">> Standard Queue Cases (Flagged, did not trip honeypot): {len(patrol_queue)}")
+print(f">> Pro-Player Safety Queue: {len(pro_queue)}")
 
 
 # ==========================================
-# PHASE 3: JUDGE AUDITING (TEST CASES)
+# PHASE 4: STANDARD CASE EVALUATION (CONCURRENT AUDITS)
 # ==========================================
-print("\n[PHASE 3] Executing Anti-Fraud Audits (Injecting Test Cases)...")
-demoted_judges = 0
+# Inject some calibration checks for judges to prevent lazy voting
 for j in judges:
-    # Inject 5 calibration cases with pre-validated outcomes
     for _ in range(5):
         test_case = Player("TEST", "cheater" if random.random() > 0.5 else "clean")
-        verdict = j.evaluate_case(test_case, is_test_case=True)
-        correct_outcome = "Guilty" if test_case.role == "cheater" else "Innocent"
-        
-        if verdict == correct_outcome:
-            j.test_cases_passed += 1
-            j.rating += 5  # Minor rating increase for consistency
+        verdict = j.evaluate_case(test_case)
+        correct = "Guilty" if test_case.role == "cheater" else "Innocent"
+        if verdict == correct:
+            j.rating += 5
         else:
-            j.test_cases_failed += 1
-            j.rating -= 40  # Rapid Glicko-2 decay for incorrect verdicts
+            j.rating -= 40
 
-# Quarantine low-performing or lazy judges
-for j in judges:
-    if j.test_cases_failed >= 3:
-        j.lazy_voter = True
-        j.rating -= 100
-        demoted_judges += 1
-
-print(f">> Audit complete. Lazy or inaccurate judges restricted: {demoted_judges}")
-
-
-# ==========================================
-# PHASE 4: STANDARD CASE EVALUATION
-# ==========================================
-print("\n[PHASE 4] Distributing cases to Overwatch 2.0 Judges...")
-
+# Process Standard Queue
 for player in patrol_queue:
-    # Select 20 to 30 independent judges
     num_judges = random.randint(20, 30)
     assigned_judges = random.sample(judges, num_judges)
 
@@ -176,37 +188,28 @@ for player in patrol_queue:
     guilty_weight = 0
 
     for judge in assigned_judges:
-        # Ignore judges whose rating has decayed below the minimum trust threshold
         if judge.rating < 1100:
             continue
-        
         verdict = judge.evaluate_case(player)
         weight = judge.vote_weight
-        
         total_weight += weight
         if verdict == "Guilty":
             guilty_weight += weight
 
-    # Calculate weighted consensus ratio
     guilty_ratio = (guilty_weight / total_weight) if total_weight > 0 else 0
-
-    if guilty_ratio >= 0.65:  # Requires a 65% weighted consensus to flag
+    if guilty_ratio >= 0.65:
         player.status = "Shadow_Flagged"
-        player.shadow_matches_left = 3  # Start 3-match monitoring window
+        player.shadow_matches_left = 3
 
 
 # ==========================================
-# PHASE 5: PRO-PLAYER SAFETY VALVE
+# PHASE 5: ELITE REVIEW & VALVE SAFETY VALVE FOR PROS
 # ==========================================
-print("\n[PHASE 5] Processing Professional Player Escalations...")
-# Filter and retrieve the top 30 judges based on Glicko-2 ratings
+print("\n[PHASE 5] Executing Pro-Player Safety Valve...")
 best_judges = sorted(judges, key=lambda x: x.rating, reverse=True)[:30]
-average_best_rating = sum(j.rating for j in best_judges) / 30
-
-print(f">> Assigned elite panel of 30 judges (Average Glicko-2: {average_best_rating:.1f})")
 
 for pro in pro_queue:
-    print(f"  * Case Review: {pro.id}")
+    print(f"  * Escalated Case: {pro.id}")
     total_weight = 0
     guilty_weight = 0
 
@@ -218,46 +221,40 @@ for pro in pro_queue:
             guilty_weight += weight
 
     consensus = (guilty_weight / total_weight) if total_weight > 0 else 0
-    print(f"    - Overwatch Consensus: {consensus*100:.1f}% voted Guilty (due to near-inhuman reflex patterns)")
-    
-    # Send case to Valve Employee manual verification to bypass false bans
-    print(f"    - [SAFETY OVERRIDE] Escalated to Valve Employee Manual Review.")
-    print(f"    - [Valve Verdict]: Player identity verified as white-listed pro. Account cleared. Status: Clean.")
+    print(f"    - Elite Panel Vote: {consensus*100:.1f}% voted Guilty")
+    print(f"    - [CRITICAL OVERRIDE] Sent to Valve Security Operations.")
+    print(f"    - [Valve Verdict]: Verified as professional match performance. Status cleared.")
     pro.status = "Active"
 
 
 # ==========================================
 # PHASE 6: SHADOW PERIOD VERIFICATION (2-3 MATCHES)
 # ==========================================
-print("\n[PHASE 6] Enforcing '2-3 Match Rule' Shadow Period...")
+print("\n[PHASE 6] Verifying Shadow Flagged Accounts over 2-3 Matches...")
 
 banned_cheaters = 0
 false_positives = 0
 
 for p in players:
     if p.status == "Shadow_Flagged":
-        # Monitor player behavior over subsequent matches
-        anomalies_detected_during_test = False
+        anomalies_detected = False
         
+        # Monitor subsequent matches
         for _ in range(p.shadow_matches_left):
             if p.role == "cheater":
-                # Active cheaters cannot disable their software consistently and will trip telemetry again
-                if random.random() > 0.15: # 85% chance of recurrence over 3 matches
-                    anomalies_detected_during_test = True
+                if random.random() > 0.15:  # 85% chance they keep using the cheat
+                    anomalies_detected = True
             elif p.role == "clean":
-                # Clean players naturally return to baseline performance metrics
-                if random.random() < 0.01: # 1% statistical anomaly recurrence
-                    anomalies_detected_during_test = True
+                if random.random() < 0.01:  # 1% chance of repeating a highly suspicious anomaly
+                    anomalies_detected = True
 
-        # Finalize verdict based on shadow telemetry + honeypot history
-        if anomalies_detected_during_test or p.honeypot_triggered:
+        if anomalies_detected or p.honeypot_triggered:
             p.status = "Banned"
             if p.role == "cheater":
                 banned_cheaters += 1
             else:
                 false_positives += 1
         else:
-            # Telemetry returned to normal, flag safely removed
             p.status = "Active"
 
 
@@ -268,19 +265,12 @@ print("\n" + "="*20 + " HYBRID SYSTEM PERFORMANCE DASHBOARD " + "="*20)
 print(f"Total Player Base Simulated:       {TOTAL_PLAYERS}")
 print(f"Actual Active Cheaters:            {SUSPICIOUS_PLAYERS_COUNT}")
 print(f"Actual Professional Players:       {PRO_PLAYERS_COUNT}")
-print("-" * 71)
+print("-" * 75)
 detection_rate = (banned_cheaters / SUSPICIOUS_PLAYERS_COUNT) * 100
 print(f"Successfully Banned Cheaters:      {banned_cheaters} / {SUSPICIOUS_PLAYERS_COUNT} ({detection_rate:.1f}%)")
+print(f" * Caught via dynamic honeypots:   {honeypots_triggered_count}")
+print(f" * Caught via Overwatch consensus:  {banned_cheaters - honeypots_triggered_count}")
+print("-" * 75)
 print(f"False Positives (Clean Players):   {false_positives} (False Positive Rate: {false_positives/TOTAL_PLAYERS*100:.3f}%)")
 print(f"False Positives (Pro Players):     0 / {PRO_PLAYERS_COUNT} (0% Error rate achieved via Valve safety valve)")
-print("-" * 71)
-
-# Display Judge Rank Distribution
-trainees = len([j for j in judges if j.rank == "Trainee"])
-full_judges = len([j for j in judges if j.rank == "Judge"])
-senior_judges = len([j for j in judges if j.rank == "Senior Judge"])
-print("Patrol System Glicko-2 Distribution:")
-print(f" * Trainees (Vote Weight = 1):     {trainees} judges")
-print(f" * Judges (Vote Weight = 3):       {full_judges} judges")
-print(f" * Senior Judges (Vote Weight = 9):{senior_judges} judges")
 print("="*77)
