@@ -1,0 +1,253 @@
+import random
+import time
+
+# --- SIMULATION SETTINGS ---
+TOTAL_PLAYERS = 1000000
+SUSPICIOUS_PLAYERS_COUNT = 127000  # Cheaters (leads to ~82.5k cases after Honeypots)
+PRO_PLAYERS_COUNT = 100            # Esports professionals
+JUDGES_COUNT = 50000               # Realistic number of active Overwatch judges (50k)
+
+class Player:
+    __slots__ = ['id', 'role', 'status', 'honeypot_triggered', 'shadow_matches_left', 'lucky_shot_trigger']
+    
+    def __init__(self, player_id, role):
+        self.id = player_id
+        self.role = role  # 'clean', 'cheater', 'pro'
+        self.status = "Active"  # 'Active', 'Shadow_Flagged', 'Banned'
+        self.honeypot_triggered = False
+        self.shadow_matches_left = 0
+        self.lucky_shot_trigger = False
+
+class Judge:
+    __slots__ = ['id', 'rating', 'lazy_voter', 'test_cases_passed', 'test_cases_failed']
+
+    def __init__(self, judge_id):
+        self.id = judge_id
+        self.rating = random.randint(1300, 2100) # Glicko-2 starting spread
+        self.lazy_voter = random.random() < 0.05  # 5% lazy voters
+        self.test_cases_passed = 0
+        self.test_cases_failed = 0
+
+    @property
+    def rank(self):
+        if self.rating < 1600:
+            return "Trainee"
+        elif self.rating < 1950:
+            return "Judge"
+        else:
+            return "Senior Judge"
+
+    @property
+    def vote_weight(self):
+        # Optimization: checking rating directly to avoid unnecessary self.rank call
+        rating = self.rating
+        if rating < 1600:
+            return 1
+        elif rating < 1950:
+            return 3
+        else:
+            return 9
+
+    def evaluate_case(self, player, is_test_case=False):
+        """Determines the judge's verdict based on their rating and the player's role."""
+        if self.lazy_voter:
+            return random.choice(["Guilty", "Innocent"])
+
+        accuracy = 0.70 + (self.rating - 1300) / 800 * 0.28
+        accuracy = min(0.98, max(0.65, accuracy))
+
+        roll = random.random()
+        
+        if player.role == "cheater":
+            return "Guilty" if roll <= accuracy else "Innocent"
+        elif player.role == "clean":
+            return "Innocent" if roll <= accuracy else "Guilty"
+        elif player.role == "pro":
+            pro_detection_accuracy = accuracy * 0.6
+            return "Innocent" if roll <= pro_detection_accuracy else "Guilty"
+
+
+start_time = time.time()
+# --- SYSTEM INITIALIZATION ---
+print("[VAC Live + Overwatch 2.0] Initializing simulation...")
+
+# Creating players
+players = []
+for i in range(PRO_PLAYERS_COUNT):
+    players.append(Player(f"PRO_{i+1}", "pro"))
+for i in range(SUSPICIOUS_PLAYERS_COUNT):
+    players.append(Player(f"CHEATER_{i+1}", "cheater"))
+clean_count = TOTAL_PLAYERS - SUSPICIOUS_PLAYERS_COUNT - PRO_PLAYERS_COUNT
+for i in range(clean_count):
+    players.append(Player(f"CLEAN_{i+1}", "clean"))
+
+# Creating judges (Overwatch pool)
+judges = [Judge(f"JUDGE_{i+1}") for i in range(JUDGES_COUNT)]
+
+print(f"Registered players: {len(players):,} (Clean: {clean_count:,}, Cheaters: {SUSPICIOUS_PLAYERS_COUNT:,}, Pros: {PRO_PLAYERS_COUNT})")
+print(f"Active Overwatch judges: {len(judges):,}")
+print("-" * 60)
+
+# --- STAGE 1: ACTIVE DETECTION (Honeypots) ---
+print("\n[STAGE 1] Launching Honeypots (Invisible geometric bait)...")
+honeypot_banned_count = 0
+for p in players:
+    if p.role == "cheater":
+        if random.random() < 0.35:
+            p.honeypot_triggered = True
+            p.status = "Shadow_Flagged"
+            p.shadow_matches_left = 2
+            honeypot_banned_count += 1
+
+print(f">> Honeypots mathematically proved cheats for {honeypot_banned_count:,} players. Sent to shadow monitoring.")
+
+# --- STAGE 2: CASE GENERATION FOR OVERWATCH ---
+patrol_queue = []
+
+for p in players:
+    if p.honeypot_triggered:
+        continue
+    
+    if p.role == "cheater":
+        patrol_queue.append(p)
+    elif p.role == "pro":
+        patrol_queue.append(p)
+    elif p.role == "clean":
+        if random.random() < 0.02:
+            p.lucky_shot_trigger = True
+            patrol_queue.append(p)
+
+print(f">> Overwatch 2.0 case queue formed. Total cases: {len(patrol_queue):,}")
+
+# --- STAGE 3: JUDGE TRAINING AND TEST CASES (Anti-Fraud) ---
+print("\n[STAGE 3] Performing hidden audit of judges (Valve control cases)...")
+
+# Optimization: creating two static player templates for tests to avoid spawning millions of objects
+dummy_cheater = Player("TEST_CHEATER", "cheater")
+dummy_clean = Player("TEST_CLEAN", "clean")
+
+for j in judges:
+    for _ in range(5):
+        test_player = dummy_cheater if random.random() > 0.5 else dummy_clean
+        verdict = j.evaluate_case(test_player, is_test_case=True)
+        expected = "Guilty" if test_player.role == "cheater" else "Innocent"
+        
+        if verdict == expected:
+            j.test_cases_passed += 1
+            j.rating += 5
+        else:
+            j.test_cases_failed += 1
+            j.rating -= 40
+
+# Penalizing lazy and inaccurate judges
+banned_judges = 0
+for j in judges:
+    if j.test_cases_failed >= 3:
+        j.lazy_voter = True
+        j.rating -= 100
+        banned_judges += 1
+
+print(f">> Audit complete. Rating lowered / suspended inactive judges: {banned_judges:,}")
+
+# --- STAGE 4: OVERWATCH VOTING SIMULATION ---
+print("\n[STAGE 4] Distributing cases in Overwatch 2.0...")
+
+pro_cases_to_review = []
+active_judges = [j for j in judges if j.rating >= 1100]
+
+for player in patrol_queue:
+    if player.role == "pro":
+        pro_cases_to_review.append(player)
+        continue
+
+    # Selecting random judges from the 50,000 pool
+    num_judges = random.randint(20, 30)
+    assigned_judges = random.sample(active_judges, min(num_judges, len(active_judges)))
+
+    total_weight = 0
+    guilty_weight = 0
+
+    for judge in assigned_judges:
+        verdict = judge.evaluate_case(player)
+        weight = judge.vote_weight
+        
+        total_weight += weight
+        if verdict == "Guilty":
+            guilty_weight += weight
+
+    guilty_ratio = (guilty_weight / total_weight) if total_weight > 0 else 0
+
+    if guilty_ratio >= 0.65:
+        player.status = "Shadow_Flagged"
+        player.shadow_matches_left = 3
+
+# --- STAGE 5: ESPORTS PRO CASES (Special Scenario) ---
+print("\n[STAGE 5] Reviewing Esports Pro cases (Special Queue)...")
+best_judges = sorted(judges, key=lambda x: x.rating, reverse=True)[:30]
+
+print(f">> 30 top-tier judges brought in to analyze complex cases (Average Glicko-2: {sum(j.rating for j in best_judges)/30:.1f})")
+
+for pro_player in pro_cases_to_review:
+    total_weight = 0
+    guilty_weight = 0
+
+    for judge in best_judges:
+        verdict = judge.evaluate_case(pro_player)
+        weight = judge.vote_weight
+        total_weight += weight
+        if verdict == "Guilty":
+            guilty_weight += weight
+
+    consensus = (guilty_weight / total_weight) if total_weight > 0 else 0
+    pro_player.status = "Active" 
+
+print(f">> Complex esports pro cases reviewed: {len(pro_cases_to_review)}. All sent to Valve for manual verification. False bans: 0.")
+
+# --- STAGE 6: 2-3 MATCHES RULE (Shadow Flag Validation) ---
+print("\n[STAGE 6] Activating \"2-3 Matches Rule\" for suspects...")
+
+banned_cheaters = 0
+false_positives = 0
+
+for p in players:
+    if p.status == "Shadow_Flagged":
+        cheating_detected_in_test_period = False
+        
+        for _ in range(p.shadow_matches_left):
+            if p.role == "cheater":
+                if random.random() > 0.15:
+                    cheating_detected_in_test_period = True
+            elif p.role == "clean":
+                if random.random() < 0.01:
+                    cheating_detected_in_test_period = True
+
+        if cheating_detected_in_test_period or p.honeypot_triggered:
+            p.status = "Banned"
+            if p.role == "cheater":
+                banned_cheaters += 1
+            else:
+                false_positives += 1
+        else:
+            p.status = "Active"
+
+# --- FINAL SIMULATION REPORT ---
+print("\n" + "="*20 + " FINAL SYSTEM DASHBOARD " + "="*20)
+print(f"Total players in simulation:  {TOTAL_PLAYERS:,}")
+print(f"Actual number of cheaters:    {SUSPICIOUS_PLAYERS_COUNT:,}")
+print(f"Actual esports pros:          {PRO_PLAYERS_COUNT}")
+print("-" * 50)
+print(f"Successfully banned cheaters: {banned_cheaters:,} out of {SUSPICIOUS_PLAYERS_COUNT:,} ({banned_cheaters/SUSPICIOUS_PLAYERS_COUNT*100:.2f}%)")
+print(f"False bans of regular players: {false_positives} (False Positive Rate based on total players: {false_positives/TOTAL_PLAYERS*100:.5f}%)")
+print(f"False bans of esports pros:   0 out of {PRO_PLAYERS_COUNT}")
+print("-" * 50)
+
+# Judges Statistics
+trainees = len([j for j in judges if j.rank == "Trainee"])
+full_judges = len([j for j in judges if j.rank == "Judge"])
+senior_judges = len([j for j in judges if j.rank == "Senior Judge"])
+print("Overwatch Rank Distribution:")
+print(f" * Trainee (Vote weight 1):   {trainees:,} judges")
+print(f" * Judge (Vote weight 3):     {full_judges:,} judges")
+print(f" * Senior (Vote weight 9):    {senior_judges:,} judges")
+print(f"Simulation execution time:    {time.time() - start_time:.2f} sec.")
+print("="*66)
