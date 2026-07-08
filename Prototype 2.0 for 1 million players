@@ -122,7 +122,6 @@ print(f">> Overwatch 2.0 case queue formed. Total cases: {len(patrol_queue):,}")
 # --- STAGE 3: JUDGE TRAINING AND TEST CASES (Anti-Fraud) ---
 print("\n[STAGE 3] Performing hidden audit of judges (Valve control cases)...")
 
-# Optimization: creating two static player templates for tests to avoid spawning millions of objects
 dummy_cheater = Player("TEST_CHEATER", "cheater")
 dummy_clean = Player("TEST_CLEAN", "clean")
 
@@ -134,17 +133,18 @@ for j in judges:
         
         if verdict == expected:
             j.test_cases_passed += 1
-            j.rating += 5
+            j.rating += 15  # Увеличили награду за правильный вердикт
         else:
             j.test_cases_failed += 1
-            j.rating -= 40
+            j.rating -= 25  # Смягчили штраф за ошибку (теперь баланс ~1:1.6, а не 1:8)
 
-# Penalizing lazy and inaccurate judges
+# Отсекаем действительно злостных вредителей (кто завалил почти ВСЕ тесты)
 banned_judges = 0
 for j in judges:
-    if j.test_cases_failed >= 3:
+    # 4 или 5 ошибок из 5 — это уже явный признак "кликера" или ленивого бота
+    if j.test_cases_failed >= 4:
         j.lazy_voter = True
-        j.rating -= 100
+        j.rating -= 150
         banned_judges += 1
 
 print(f">> Audit complete. Rating lowered / suspended inactive judges: {banned_judges:,}")
