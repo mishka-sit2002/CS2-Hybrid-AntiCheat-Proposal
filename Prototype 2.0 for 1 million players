@@ -119,7 +119,7 @@ for p in players:
 
 print(f">> Overwatch 2.0 case queue formed. Total cases: {len(patrol_queue):,}")
 
-# --- STAGE 3: JUDGE TRAINING AND TEST CASES (Anti-Fraud) ---
+# --- STAGE 3: JUDGE TRAINING AND TEST CASES (Anti-Fraud Audit) ---
 print("\n[STAGE 3] Performing hidden audit of judges (Valve control cases)...")
 
 dummy_cheater = Player("TEST_CHEATER", "cheater")
@@ -133,15 +133,14 @@ for j in judges:
         
         if verdict == expected:
             j.test_cases_passed += 1
-            j.rating += 15  # Увеличили награду за правильный вердикт
+            j.rating += 15  # Reward for a correct verdict
         else:
             j.test_cases_failed += 1
-            j.rating -= 25  # Смягчили штраф за ошибку (теперь баланс ~1:1.6, а не 1:8)
+            j.rating -= 25  # Fair penalty for an error (balanced ~1:1.6 ratio)
 
-# Отсекаем действительно злостных вредителей (кто завалил почти ВСЕ тесты)
+# Suspending severe underperformers (bot-farms, automated macro clickers)
 banned_judges = 0
 for j in judges:
-    # 4 или 5 ошибок из 5 — это уже явный признак "кликера" или ленивого бота
     if j.test_cases_failed >= 4:
         j.lazy_voter = True
         j.rating -= 150
@@ -165,32 +164,33 @@ for player in patrol_queue:
 
     total_weight = 0
     guilty_weight = 0
+    
+    # Caching judge verdicts to eliminate double-rolling the RNG
+    stage_verdicts = []
 
     for judge in assigned_judges:
         verdict = judge.evaluate_case(player)
         weight = judge.vote_weight
+        
+        stage_verdicts.append((judge, verdict))  # Saving the exact vote
         
         total_weight += weight
         if verdict == "Guilty":
             guilty_weight += weight
 
     guilty_ratio = (guilty_weight / total_weight) if total_weight > 0 else 0
-
-    # Определяем финальный вердикт системы по игроку
     system_verdict = "Guilty" if guilty_ratio >= 0.65 else "Innocent"
 
     if system_verdict == "Guilty":
         player.status = "Shadow_Flagged"
         player.shadow_matches_left = 3
 
-    # ДИНАМИЧЕСКИЙ АПДЕЙТ РЕЙТИНГА СУДЕЙ (Glicko-2 симуляция за реальный кейс)
-    # Если вердикт судьи совпал с консенсусом большинства — повышаем рейтинг, если нет — снижаем.
-    for judge in assigned_judges:
-        verdict = judge.evaluate_case(player)
-        if verdict == system_verdict:
-            judge.rating = min(2500, judge.rating + 2) # Максимум 2500
+    # Glicko-2 dynamic rating update based on the cached verdicts
+    for judge, original_verdict in stage_verdicts:
+        if original_verdict == system_verdict:
+            judge.rating = min(2500, judge.rating + 2)  # Cap rating at 2500
         else:
-            judge.rating = max(100, judge.rating - 5)  # Минимум 100, в минус не уходим
+            judge.rating = max(100, judge.rating - 5)   # Hard floor at 100
 
 # --- STAGE 5: ESPORTS PRO CASES (Special Scenario) ---
 print("\n[STAGE 5] Reviewing Esports Pro cases (Special Queue)...")
