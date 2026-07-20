@@ -1,3 +1,4 @@
+[![License: MSG](https://img.shields.io/badge/License-MSG%20v1.0-blue.svg)](LICENSE)
 # VAC Live + Overwatch 2.0: Hybrid Anti-Cheat System (Proposal)
 **Author:** (steam mishka.sit2002) 
 **Version:** 3.5 (Final)  
