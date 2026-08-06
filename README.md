@@ -38,4 +38,4 @@ This proposal also includes a logic fix for the "Fall Damage" bug in Source 2:
 
 ## 💻 How to use this repository
 1. Read the documentation above for the logic.
-2. Run `prototype.py` (to be added) to see the Python simulation of judge ratings and case processing.
+2. Run `Prototype 2.0 for 1 million players` (to be added) to see the Python simulation of judge ratings and case processing.
